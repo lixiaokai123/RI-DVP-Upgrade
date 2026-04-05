@@ -1,0 +1,33 @@
+<!-- 
+  bag_to_pcd.launch
+  离线转换rosbag到PCD文件
+  
+  使用方法:
+    roslaunch rosbag2pcd bag_to_pcd.launch \
+        bag_file:=/path/to/data.bag \
+        pose_file:=/path/to/poses.txt \
+        output_dir:=/path/to/output
+-->
+<launch>
+    <!-- 必需参数 -->
+    <arg name="bag_file" doc="Path to the rosbag file"/>
+    <arg name="pose_file" doc="Path to the pose txt file"/>
+    <arg name="output_dir" default="$(find rosbag2pcd)/output" doc="Output directory for PCD files"/>
+    
+    <!-- 可选参数 -->
+    <arg name="topic" default="/rslidar_points" doc="PointCloud2 topic name"/>
+    <arg name="map_file" default="map.pcd" doc="Output map filename"/>
+    <arg name="pose_format" default="1" doc="Pose file format: 1=ts tx ty tz qw qx qy qz, 2=ts tx ty tz qx qy qz qw, 3=tx ty tz qw qx qy qz"/>
+    <arg name="voxel_size" default="0.1" doc="Voxel size for map downsampling"/>
+    
+    <!-- 启动离线转换节点 -->
+    <node pkg="rosbag2pcd" type="bag_to_pcd_offline" name="bag_to_pcd_offline" output="screen">
+        <param name="bag_file" value="$(arg bag_file)"/>
+        <param name="pose_file" value="$(arg pose_file)"/>
+        <param name="output_dir" value="$(arg output_dir)"/>
+        <param name="topic" value="$(arg topic)"/>
+        <param name="map_file" value="$(arg map_file)"/>
+        <param name="pose_format" value="$(arg pose_format)"/>
+        <param name="voxel_size" value="$(arg voxel_size)"/>
+    </node>
+</launch>

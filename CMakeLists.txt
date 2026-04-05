@@ -1,84 +1,73 @@
-cmake_minimum_required(VERSION 3.14)
-project(ri_dvp VERSION 1.0.0 LANGUAGES CXX)
+cmake_minimum_required(VERSION 3.0.2)
+project(rosbag2pcd)
 
-# C++17 standard
+# C++17
 set(CMAKE_CXX_STANDARD 17)
 set(CMAKE_CXX_STANDARD_REQUIRED ON)
-set(CMAKE_CXX_EXTENSIONS OFF)
+set(CMAKE_BUILD_TYPE Release)
 
-# Build type
-if(NOT CMAKE_BUILD_TYPE)
-    set(CMAKE_BUILD_TYPE Release)
-endif()
-
-# Optimization flags
-set(CMAKE_CXX_FLAGS_DEBUG "-g -O0 -Wall -Wextra")
-set(CMAKE_CXX_FLAGS_RELEASE "-O3 -DNDEBUG -march=native")
-
-# Find Eigen3
-find_package(Eigen3 3.3 REQUIRED NO_MODULE)
-
-# Option for OpenMP parallelization
-option(USE_OPENMP "Enable OpenMP parallelization" ON)
-if(USE_OPENMP)
-    find_package(OpenMP)
-    if(OpenMP_CXX_FOUND)
-        message(STATUS "OpenMP found, enabling parallelization")
-    endif()
-endif()
-
-# ============================================================================
-# Library
-# ============================================================================
-add_library(ri_dvp_lib STATIC
-    src/ri_dvp_components.cpp
-    src/ri_dvp_processor.cpp
+# 查找catkin依赖
+find_package(catkin REQUIRED COMPONENTS
+  roscpp
+  sensor_msgs
+  pcl_ros
+  pcl_conversions
+  rosbag
+  tf2
+  tf2_ros
 )
 
-target_include_directories(ri_dvp_lib
-    PUBLIC
-        $<BUILD_INTERFACE:${CMAKE_CURRENT_SOURCE_DIR}/include>
-        $<INSTALL_INTERFACE:include>
+# 查找PCL
+find_package(PCL 1.8 REQUIRED)
+
+catkin_package(
+  CATKIN_DEPENDS 
+    roscpp 
+    sensor_msgs 
+    pcl_ros 
+    pcl_conversions 
+    rosbag
+    tf2
+    tf2_ros
 )
 
-target_link_libraries(ri_dvp_lib
-    PUBLIC
-        Eigen3::Eigen
+include_directories(
+  ${catkin_INCLUDE_DIRS}
+  ${PCL_INCLUDE_DIRS}
 )
 
-if(OpenMP_CXX_FOUND)
-    target_link_libraries(ri_dvp_lib PUBLIC OpenMP::OpenMP_CXX)
-    target_compile_definitions(ri_dvp_lib PUBLIC USE_OPENMP)
-endif()
+link_directories(${PCL_LIBRARY_DIRS})
+add_definitions(${PCL_DEFINITIONS})
 
-# ============================================================================
-# Main Executable
-# ============================================================================
-add_executable(ri_dvp_demo src/main.cpp)
-target_link_libraries(ri_dvp_demo PRIVATE ri_dvp_lib)
-
-# ============================================================================
-# Installation
-# ============================================================================
-install(TARGETS ri_dvp_lib ri_dvp_demo
-    LIBRARY DESTINATION lib
-    ARCHIVE DESTINATION lib
-    RUNTIME DESTINATION bin
+# 可执行文件1: rosbag离线转换工具
+add_executable(bag_to_pcd_offline src/bag_to_pcd_offline.cpp)
+target_link_libraries(bag_to_pcd_offline
+  ${catkin_LIBRARIES}
+  ${PCL_LIBRARIES}
 )
 
-install(DIRECTORY include/
-    DESTINATION include
+# 可执行文件2: 实时订阅转换节点
+add_executable(pointcloud_to_pcd_node src/pointcloud_to_pcd_node.cpp)
+target_link_libraries(pointcloud_to_pcd_node
+  ${catkin_LIBRARIES}
+  ${PCL_LIBRARIES}
 )
 
-# ============================================================================
-# Summary
-# ============================================================================
-message(STATUS "")
-message(STATUS "========================================")
-message(STATUS "RI-DVP Configuration Summary")
-message(STATUS "========================================")
-message(STATUS "  Build type: ${CMAKE_BUILD_TYPE}")
-message(STATUS "  C++ standard: ${CMAKE_CXX_STANDARD}")
-message(STATUS "  OpenMP: ${OpenMP_CXX_FOUND}")
-message(STATUS "========================================")
-message(STATUS "")
+# 可执行文件3: 地图生成工具（从已保存的PCD生成）
+add_executable(generate_map src/generate_map.cpp)
+target_link_libraries(generate_map
+  ${catkin_LIBRARIES}
+  ${PCL_LIBRARIES}
+)
+
+# 安装
+install(TARGETS 
+  bag_to_pcd_offline 
+  pointcloud_to_pcd_node
+  generate_map
+  RUNTIME DESTINATION ${CATKIN_PACKAGE_BIN_DESTINATION}
+)
+
+install(DIRECTORY launch/
+  DESTINATION ${CATKIN_PACKAGE_SHARE_DESTINATION}/launch
+)

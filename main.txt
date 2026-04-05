@@ -1,0 +1,330 @@
+#include "ri_dvp.hpp"
+#include <iostream>
+#include <fstream>
+#include <sstream>
+#include <chrono>
+#include <iomanip>
+
+using namespace ri_dvp;
+
+// ============================================================================
+// Point Cloud I/O Utilities
+// ============================================================================
+
+/**
+ * @brief Load point cloud from PCD file (simplified ASCII format)
+ */
+std::vector<PointXYZI> loadPCD(const std::string& filename) {
+    std::vector<PointXYZI> cloud;
+    std::ifstream file(filename);
+    
+    if (!file.is_open()) {
+        std::cerr << "Error: Cannot open file " << filename << std::endl;
+        return cloud;
+    }
+    
+    std::string line;
+    bool data_started = false;
+    
+    while (std::getline(file, line)) {
+        if (line.find("DATA") != std::string::npos) {
+            data_started = true;
+            continue;
+        }
+        
+        if (data_started && !line.empty()) {
+            std::istringstream iss(line);
+            PointXYZI pt;
+            if (iss >> pt.x >> pt.y >> pt.z >> pt.intensity) {
+                cloud.push_back(pt);
+            }
+        }
+    }
+    
+    return cloud;
+}
+
+/**
+ * @brief Load point cloud from binary format (common in KITTI)
+ */
+std::vector<PointXYZI> loadBinaryPointCloud(const std::string& filename) {
+    std::vector<PointXYZI> cloud;
+    std::ifstream file(filename, std::ios::binary);
+    
+    if (!file.is_open()) {
+        std::cerr << "Error: Cannot open file " << filename << std::endl;
+        return cloud;
+    }
+    
+    float buffer[4];
+    while (file.read(reinterpret_cast<char*>(buffer), 4 * sizeof(float))) {
+        PointXYZI pt;
+        pt.x = buffer[0];
+        pt.y = buffer[1];
+        pt.z = buffer[2];
+        pt.intensity = buffer[3];
+        cloud.push_back(pt);
+    }
+    
+    return cloud;
+}
+
+/**
+ * @brief Save point cloud to PCD file
+ */
+void savePCD(const std::vector<PointWithLabel>& cloud, const std::string& filename) {
+    std::ofstream file(filename);
+    
+    if (!file.is_open()) {
+        std::cerr << "Error: Cannot create file " << filename << std::endl;
+        return;
+    }
+    
+    // Write PCD header
+    file << "# .PCD v0.7 - Point Cloud Data file format\n";
+    file << "VERSION 0.7\n";
+    file << "FIELDS x y z intensity label\n";
+    file << "SIZE 4 4 4 4 4\n";
+    file << "TYPE F F F F I\n";
+    file << "COUNT 1 1 1 1 1\n";
+    file << "WIDTH " << cloud.size() << "\n";
+    file << "HEIGHT 1\n";
+    file << "VIEWPOINT 0 0 0 1 0 0 0\n";
+    file << "POINTS " << cloud.size() << "\n";
+    file << "DATA ascii\n";
+    
+    for (const auto& pt : cloud) {
+        file << pt.x << " " << pt.y << " " << pt.z << " " 
+             << pt.intensity << " " << pt.label << "\n";
+    }
+    
+    std::cout << "Saved " << cloud.size() << " points to " << filename << std::endl;
+}
+
+/**
+ * @brief Load pose from text file (x y z qx qy qz qw)
+ */
+Eigen::Isometry3d loadPose(const std::string& line) {
+    std::istringstream iss(line);
+    double x, y, z, qx, qy, qz, qw;
+    iss >> x >> y >> z >> qx >> qy >> qz >> qw;
+    
+    Eigen::Isometry3d pose = Eigen::Isometry3d::Identity();
+    pose.translation() = Eigen::Vector3d(x, y, z);
+    pose.linear() = Eigen::Quaterniond(qw, qx, qy, qz).toRotationMatrix();
+    
+    return pose;
+}
+
+// ============================================================================
+// Demo: Generate Synthetic Test Data
+// ============================================================================
+
+/**
+ * @brief Generate a simple synthetic scene for testing
+ */
+std::pair<std::vector<PointXYZI>, Eigen::Isometry3d> generateSyntheticFrame(int frame_id) {
+    std::vector<PointXYZI> cloud;
+    
+    // Generate ground plane (z = 0)
+    for (float x = -20.0f; x <= 20.0f; x += 0.3f) {
+        for (float y = -20.0f; y <= 20.0f; y += 0.3f) {
+            PointXYZI pt;
+            pt.x = x;
+            pt.y = y;
+            pt.z = 0.0f + 0.02f * (rand() % 100 - 50) / 50.0f;  // Small noise
+            pt.intensity = 30.0f + 10.0f * (rand() % 100) / 100.0f;  // Asphalt
+            cloud.push_back(pt);
+        }
+    }
+    
+    // Generate static wall (x = 15)
+    for (float y = -10.0f; y <= 10.0f; y += 0.2f) {
+        for (float z = 0.0f; z <= 3.0f; z += 0.2f) {
+            PointXYZI pt;
+            pt.x = 15.0f + 0.02f * (rand() % 100 - 50) / 50.0f;
+            pt.y = y;
+            pt.z = z;
+            pt.intensity = 80.0f + 20.0f * (rand() % 100) / 100.0f;  // Concrete
+            cloud.push_back(pt);
+        }
+    }
+    
+    // Generate moving pedestrian (changes position each frame)
+    float ped_x = 5.0f + frame_id * 0.5f;
+    float ped_y = 3.0f;
+    for (float dz = 0.0f; dz <= 1.8f; dz += 0.1f) {
+        for (int i = 0; i < 5; ++i) {
+            PointXYZI pt;
+            pt.x = ped_x + 0.2f * (rand() % 100 - 50) / 50.0f;
+            pt.y = ped_y + 0.2f * (rand() % 100 - 50) / 50.0f;
+            pt.z = dz;
+            pt.intensity = 50.0f + 30.0f * (rand() % 100) / 100.0f;  // Clothing
+            cloud.push_back(pt);
+        }
+    }
+    
+    // Generate parked car (static, high intensity - metal)
+    float car_x = 8.0f;
+    float car_y = -5.0f;
+    for (float dx = 0.0f; dx <= 4.0f; dx += 0.15f) {
+        for (float dy = 0.0f; dy <= 1.8f; dy += 0.15f) {
+            for (float dz = 0.0f; dz <= 1.5f; dz += 0.15f) {
+                // Simple box shape for car
+                if (dz < 0.3f || dz > 1.2f || 
+                    (dx > 0.5f && dx < 3.5f && dy > 0.2f && dy < 1.6f)) {
+                    PointXYZI pt;
+                    pt.x = car_x + dx;
+                    pt.y = car_y + dy;
+                    pt.z = dz;
+                    pt.intensity = 150.0f + 50.0f * (rand() % 100) / 100.0f;  // Metal
+                    cloud.push_back(pt);
+                }
+            }
+        }
+    }
+    
+    // Generate moving vehicle (changes position each frame)
+    float mov_car_x = -5.0f + frame_id * 1.0f;
+    float mov_car_y = 0.0f;
+    for (float dx = 0.0f; dx <= 4.0f; dx += 0.15f) {
+        for (float dy = 0.0f; dy <= 1.8f; dy += 0.15f) {
+            for (float dz = 0.0f; dz <= 1.5f; dz += 0.15f) {
+                if (dz < 0.3f || dz > 1.2f || 
+                    (dx > 0.5f && dx < 3.5f && dy > 0.2f && dy < 1.6f)) {
+                    PointXYZI pt;
+                    pt.x = mov_car_x + dx;
+                    pt.y = mov_car_y + dy;
+                    pt.z = dz;
+                    pt.intensity = 180.0f + 50.0f * (rand() % 100) / 100.0f;  // Metal
+                    cloud.push_back(pt);
+                }
+            }
+        }
+    }
+    
+    // Sensor pose (identity for simplicity)
+    Eigen::Isometry3d pose = Eigen::Isometry3d::Identity();
+    
+    return {cloud, pose};
+}
+
+// ============================================================================
+// Main Function
+// ============================================================================
+int main(int argc, char** argv) {
+    std::cout << "========================================\n";
+    std::cout << "  RI-DVP: Range Image Dynamic Vehicle/\n";
+    std::cout << "          Pedestrian Removal Framework\n";
+    std::cout << "========================================\n\n";
+    
+    // Configure the processor
+    RIDVPConfig config;
+    config.img_width = 1024;
+    config.img_height = 64;
+    config.fov_up = 15.0;
+    config.fov_down = -25.0;
+    config.tau_dist_high = 0.5;
+    config.tau_dist_low = 0.1;
+    config.tau_intensity = 0.15;
+    config.cluster_tolerance = 0.3;
+    config.sliding_window_size = 5;
+    
+    std::cout << "Configuration:\n";
+    std::cout << "  - Range Image: " << config.img_width << "x" << config.img_height << "\n";
+    std::cout << "  - FOV: " << config.fov_down << "° to " << config.fov_up << "°\n";
+    std::cout << "  - Distance Threshold (high): " << config.tau_dist_high << "m\n";
+    std::cout << "  - Distance Threshold (low): " << config.tau_dist_low << "m\n";
+    std::cout << "  - Intensity Threshold: " << config.tau_intensity << "\n";
+    std::cout << "  - Temporal Window: " << config.sliding_window_size << " frames\n\n";
+    
+    // Create processor
+    RIDVPProcessor processor(config);
+    
+    // Process mode
+    if (argc > 1) {
+        // Real data mode: process files from command line
+        std::string data_dir = argv[1];
+        int num_frames = (argc > 2) ? std::atoi(argv[2]) : 10;
+        
+        std::cout << "Processing real data from: " << data_dir << "\n";
+        std::cout << "Number of frames: " << num_frames << "\n\n";
+        
+        // Load poses if available
+        std::vector<Eigen::Isometry3d> poses;
+        std::ifstream pose_file(data_dir + "/poses.txt");
+        if (pose_file.is_open()) {
+            std::string line;
+            while (std::getline(pose_file, line)) {
+                poses.push_back(loadPose(line));
+            }
+        }
+        
+        for (int i = 0; i < num_frames; ++i) {
+            std::stringstream ss;
+            ss << data_dir << "/velodyne/" << std::setfill('0') << std::setw(6) << i << ".bin";
+            
+            auto cloud = loadBinaryPointCloud(ss.str());
+            if (cloud.empty()) {
+                std::cerr << "Warning: Empty cloud at frame " << i << std::endl;
+                continue;
+            }
+            
+            Eigen::Isometry3d pose = (i < static_cast<int>(poses.size())) 
+                                    ? poses[i] 
+                                    : Eigen::Isometry3d::Identity();
+            
+            auto start = std::chrono::high_resolution_clock::now();
+            processor.processFrame(cloud, pose);
+            auto end = std::chrono::high_resolution_clock::now();
+            
+            auto duration = std::chrono::duration_cast<std::chrono::milliseconds>(end - start);
+            
+            std::cout << "Frame " << i << ": " << cloud.size() << " points, "
+                      << duration.count() << "ms\n";
+        }
+        
+    } else {
+        // Demo mode: use synthetic data
+        std::cout << "Running in DEMO mode with synthetic data...\n";
+        std::cout << "(Provide data directory as argument for real data)\n\n";
+        
+        const int num_frames = 10;
+        
+        for (int i = 0; i < num_frames; ++i) {
+            auto [cloud, pose] = generateSyntheticFrame(i);
+            
+            auto start = std::chrono::high_resolution_clock::now();
+            processor.processFrame(cloud, pose);
+            auto end = std::chrono::high_resolution_clock::now();
+            
+            auto duration = std::chrono::duration_cast<std::chrono::milliseconds>(end - start);
+            
+            auto dynamic = processor.getDynamicPoints();
+            auto static_map = processor.getStaticMap();
+            
+            std::cout << "Frame " << i << ":\n";
+            std::cout << "  - Input points: " << cloud.size() << "\n";
+            std::cout << "  - Dynamic points: " << dynamic.size() << "\n";
+            std::cout << "  - Static map size: " << static_map.size() << "\n";
+            std::cout << "  - Processing time: " << duration.count() << "ms\n\n";
+        }
+    }
+    
+    // Save final results
+    std::cout << "========================================\n";
+    std::cout << "Saving results...\n";
+    
+    auto final_static_map = processor.getStaticMap();
+    savePCD(final_static_map, "static_map.pcd");
+    
+    auto final_dynamic = processor.getDynamicPoints();
+    savePCD(final_dynamic, "dynamic_points.pcd");
+    
+    std::cout << "\nFinal Statistics:\n";
+    std::cout << "  - Static map points: " << final_static_map.size() << "\n";
+    std::cout << "  - Dynamic points (last frame): " << final_dynamic.size() << "\n";
+    std::cout << "========================================\n";
+    
+    return 0;
+}

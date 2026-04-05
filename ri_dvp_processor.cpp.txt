@@ -1,0 +1,462 @@
+#include "ri_dvp.hpp"
+#include <algorithm>
+#include <numeric>
+#include <cmath>
+
+namespace ri_dvp {
+
+// ============================================================================
+// RIDVPProcessor Implementation
+// ============================================================================
+RIDVPProcessor::RIDVPProcessor(const RIDVPConfig& config)
+    : config_(config), frame_count_(0) {
+    
+    // Initialize range images
+    ri_current_ = std::make_unique<RangeImage>(
+        config_.img_width, config_.img_height,
+        config_.fov_up, config_.fov_down);
+    
+    ri_map_ = std::make_unique<RangeImage>(
+        config_.img_width, config_.img_height,
+        config_.fov_up, config_.fov_down);
+    
+    // Initialize global map
+    global_map_ = std::make_unique<VoxelMap>(config_.voxel_size);
+    
+    // Initialize processing components
+    normal_estimator_ = std::make_unique<NormalEstimator>(10);
+    clusterer_ = std::make_unique<EuclideanClusterer>(
+        config_.cluster_tolerance,
+        config_.min_cluster_size,
+        config_.max_cluster_size);
+}
+
+// ============================================================================
+// A. Physics-Based Preprocessing: Intensity Calibration
+// ============================================================================
+float RIDVPProcessor::computeIncidenceAngle(const PointXYZI& point,
+                                            const Eigen::Vector3f& normal) const {
+    // Beam direction: from sensor origin to point
+    Eigen::Vector3f beam_dir = point.position().normalized();
+    
+    // cos(α) = |d · n|
+    float cos_alpha = std::abs(beam_dir.dot(normal));
+    
+    return cos_alpha;
+}
+
+float RIDVPProcessor::sigmoidClamp(float cos_alpha) const {
+    // Sigmoid clamping for grazing angles
+    // When α > 75°, cos(α) < 0.259
+    const float min_cos = std::cos(config_.grazing_angle_thresh * M_PI / 180.0);
+    
+    if (cos_alpha < min_cos) {
+        // Smooth transition using sigmoid
+        float x = (cos_alpha - min_cos) / 0.1f;
+        float sigmoid = 1.0f / (1.0f + std::exp(-x * 10.0f));
+        return min_cos + (cos_alpha - min_cos) * sigmoid;
+    }
+    
+    return cos_alpha;
+}
+
+std::vector<float> RIDVPProcessor::calibrateIntensities(
+    const std::vector<PointXYZI>& cloud) {
+    
+    std::vector<float> calibrated;
+    calibrated.reserve(cloud.size());
+    
+    // First, estimate normals for all points
+    current_normals_ = normal_estimator_->estimateNormals(cloud);
+    
+    for (size_t i = 0; i < cloud.size(); ++i) {
+        const PointXYZI& pt = cloud[i];
+        float R = pt.range();
+        
+        if (R < 0.1f) {
+            calibrated.push_back(0.0f);
+            continue;
+        }
+        
+        // Compute incidence angle
+        float cos_alpha = computeIncidenceAngle(pt, current_normals_[i]);
+        cos_alpha = sigmoidClamp(cos_alpha);
+        
+        // Equation (2): I_calib = I_raw * (R/R_ref)^η * 1/cos(α)
+        float range_factor = std::pow(R / config_.ref_range, config_.range_exponent);
+        float angle_factor = 1.0f / std::max(cos_alpha, 0.1f);
+        
+        float I_calib = pt.intensity * range_factor * angle_factor;
+        
+        // Normalize to [0, 1] range
+        I_calib = std::clamp(I_calib / 255.0f, 0.0f, 1.0f);
+        
+        calibrated.push_back(I_calib);
+    }
+    
+    return calibrated;
+}
+
+// ============================================================================
+// B. Spatiotemporal Association via Spherical Projection
+// ============================================================================
+void RIDVPProcessor::buildCurrentRangeImage(
+    const std::vector<PointXYZI>& cloud,
+    const std::vector<float>& calib_intensities) {
+    
+    ri_current_->projectPointCloud(cloud, calib_intensities);
+}
+
+void RIDVPProcessor::buildMapRangeImage(const Eigen::Isometry3d& pose) {
+    ri_map_->clear();
+    
+    // Get all points from global map
+    auto map_points = global_map_->getAllPoints();
+    if (map_points.empty()) return;
+    
+    // Transform map points to current frame
+    Eigen::Isometry3d pose_inv = pose.inverse();
+    
+    std::vector<PointXYZI> transformed;
+    std::vector<float> calib_intensities;
+    transformed.reserve(map_points.size());
+    calib_intensities.reserve(map_points.size());
+    
+    for (const auto& pt : map_points) {
+        Eigen::Vector3d world_pos(pt.x, pt.y, pt.z);
+        Eigen::Vector3d local_pos = pose_inv * world_pos;
+        
+        PointXYZI local_pt;
+        local_pt.x = static_cast<float>(local_pos.x());
+        local_pt.y = static_cast<float>(local_pos.y());
+        local_pt.z = static_cast<float>(local_pos.z());
+        local_pt.intensity = pt.intensity;
+        
+        // Only include points in front of sensor
+        if (local_pt.x > 0.5f) {
+            transformed.push_back(local_pt);
+            calib_intensities.push_back(pt.calibrated_intensity);
+        }
+    }
+    
+    ri_map_->projectPointCloud(transformed, calib_intensities);
+}
+
+// ============================================================================
+// C. Dual-Criterion Feature Decision ("Aggressive Remove")
+// ============================================================================
+std::vector<int> RIDVPProcessor::dualCriterionDecision() {
+    std::vector<int> candidate_indices;
+    
+    for (int v = 0; v < ri_current_->height(); ++v) {
+        for (int u = 0; u < ri_current_->width(); ++u) {
+            const RangeImagePixel& curr = ri_current_->at(u, v);
+            const RangeImagePixel& map = ri_map_->at(u, v);
+            
+            if (!curr.valid) continue;
+            
+            int pt_idx = curr.point_index;
+            bool is_candidate = false;
+            
+            if (map.valid) {
+                // Compute residuals
+                float delta_R = std::abs(curr.range - map.range);
+                float delta_I = std::abs(curr.calibrated_intensity - map.calibrated_intensity);
+                
+                // Equation (3): Dual-criterion logic
+                // Criterion 1: Structure Mutation
+                if (delta_R > config_.tau_dist_high) {
+                    is_candidate = true;
+                }
+                // Criterion 2: Material Mutation (novel contribution)
+                else if (delta_R < config_.tau_dist_low && delta_I > config_.tau_intensity) {
+                    is_candidate = true;
+                }
+            } else {
+                // Point exists in current scan but not in map
+                // Could be new object or previously occluded area
+                // Conservatively mark as candidate
+                is_candidate = true;
+            }
+            
+            if (is_candidate) {
+                candidate_indices.push_back(pt_idx);
+                current_labeled_[pt_idx].label = 2;  // Dynamic candidate
+            }
+        }
+    }
+    
+    return candidate_indices;
+}
+
+// ============================================================================
+// D. Topology-Based Adhesion Correction ("Conservative Revert")
+// ============================================================================
+bool RIDVPProcessor::isLinearShape(const std::vector<PointWithLabel>& cluster_points) const {
+    if (cluster_points.size() < 3) return true;
+    
+    // PCA analysis to determine shape
+    Eigen::Vector3f centroid = Eigen::Vector3f::Zero();
+    for (const auto& pt : cluster_points) {
+        centroid += pt.position();
+    }
+    centroid /= cluster_points.size();
+    
+    // Compute covariance matrix
+    Eigen::Matrix3f cov = Eigen::Matrix3f::Zero();
+    for (const auto& pt : cluster_points) {
+        Eigen::Vector3f d = pt.position() - centroid;
+        cov += d * d.transpose();
+    }
+    cov /= cluster_points.size();
+    
+    // Eigenvalue analysis
+    Eigen::SelfAdjointEigenSolver<Eigen::Matrix3f> solver(cov);
+    Eigen::Vector3f eigenvalues = solver.eigenvalues();
+    
+    // Sort eigenvalues (already sorted by Eigen, ascending)
+    float lambda1 = eigenvalues(2);  // Largest
+    float lambda2 = eigenvalues(1);
+    float lambda3 = eigenvalues(0);  // Smallest
+    
+    // Linearity ratio: (λ1 - λ2) / λ1
+    float sum = lambda1 + lambda2 + lambda3 + 1e-6f;
+    float linearity = (lambda1 - lambda2) / sum;
+    
+    return linearity > config_.linear_ratio_thresh;
+}
+
+float RIDVPProcessor::computeAdhesionScore(
+    const std::vector<PointWithLabel>& cluster_points,
+    const std::vector<PointWithLabel>& static_points) const {
+    
+    if (cluster_points.empty() || static_points.empty()) {
+        return std::numeric_limits<float>::max();
+    }
+    
+    // Find minimum distance from cluster boundary to static points
+    float min_dist = std::numeric_limits<float>::max();
+    int close_count = 0;
+    
+    for (const auto& cp : cluster_points) {
+        for (const auto& sp : static_points) {
+            float dx = cp.x - sp.x;
+            float dy = cp.y - sp.y;
+            float dz = cp.z - sp.z;
+            float dist = std::sqrt(dx*dx + dy*dy + dz*dz);
+            
+            if (dist < min_dist) {
+                min_dist = dist;
+            }
+            if (dist < config_.adhesion_dist_thresh * 2) {
+                close_count++;
+            }
+        }
+    }
+    
+    // Return adhesion score (lower = more adhered)
+    return min_dist;
+}
+
+std::vector<int> RIDVPProcessor::topologyAdhesionCorrection(
+    const std::vector<int>& candidates) {
+    
+    std::vector<int> confirmed_dynamic;
+    
+    if (candidates.empty()) return confirmed_dynamic;
+    
+    // Step 1: Euclidean Clustering on candidate points
+    auto clusters = clusterer_->cluster(current_labeled_, candidates);
+    
+    // Collect static points for adhesion analysis
+    std::vector<PointWithLabel> static_points;
+    for (const auto& pt : current_labeled_) {
+        if (pt.label == 1 || pt.label == 0) {  // Static or unknown
+            static_points.push_back(pt);
+        }
+    }
+    
+    // Step 2 & 3: Analyze each cluster
+    for (const auto& cluster : clusters) {
+        // Collect cluster points
+        std::vector<PointWithLabel> cluster_points;
+        for (int idx : cluster) {
+            cluster_points.push_back(current_labeled_[idx]);
+        }
+        
+        // Compute adhesion score
+        float adhesion_score = computeAdhesionScore(cluster_points, static_points);
+        bool is_linear = isLinearShape(cluster_points);
+        
+        // Revert logic: small, linear clusters tightly adhered to static structures
+        bool should_revert = (adhesion_score < config_.adhesion_dist_thresh) &&
+                            is_linear &&
+                            (cluster.size() < 50);
+        
+        if (should_revert) {
+            // Revert to static
+            for (int idx : cluster) {
+                current_labeled_[idx].label = 1;  // Static
+            }
+        } else {
+            // Keep as dynamic
+            for (int idx : cluster) {
+                confirmed_dynamic.push_back(idx);
+            }
+        }
+    }
+    
+    return confirmed_dynamic;
+}
+
+// ============================================================================
+// E. Temporal Probabilistic Integration
+// ============================================================================
+void RIDVPProcessor::temporalIntegration(const std::vector<int>& dynamic_indices) {
+    // Collect voxel keys for dynamic points
+    std::vector<VoxelKey> dynamic_voxels;
+    for (int idx : dynamic_indices) {
+        const auto& pt = current_labeled_[idx];
+        dynamic_voxels.push_back(global_map_->getKey(pt.x, pt.y, pt.z));
+    }
+    
+    // Add to sliding window buffer
+    dynamic_history_.push_back(dynamic_voxels);
+    if (dynamic_history_.size() > static_cast<size_t>(config_.sliding_window_size)) {
+        dynamic_history_.pop_front();
+    }
+    
+    // Update probabilities in global map
+    global_map_->updateProbabilities(dynamic_voxels);
+    
+    // Count consistent dynamic observations per voxel
+    if (dynamic_history_.size() >= static_cast<size_t>(config_.sliding_window_size)) {
+        std::unordered_map<VoxelKey, int, VoxelKeyHash> voxel_counts;
+        
+        for (const auto& frame_voxels : dynamic_history_) {
+            for (const auto& key : frame_voxels) {
+                voxel_counts[key]++;
+            }
+        }
+        
+        // Mark voxels that are consistently dynamic
+        for (const auto& [key, count] : voxel_counts) {
+            if (count >= config_.sliding_window_size - 1) {
+                // This voxel is consistently observed as dynamic
+                // Update the global map
+                VoxelData* voxel = global_map_->getVoxel(key);
+                if (voxel) {
+                    for (auto& pt : voxel->points) {
+                        pt.label = 3;  // Confirmed dynamic
+                    }
+                }
+            }
+        }
+        
+        // Prune high-probability dynamic voxels from map
+        global_map_->pruneHighProbabilityDynamic(config_.dynamic_probability_thresh);
+    }
+}
+
+// ============================================================================
+// Main Processing Pipeline
+// ============================================================================
+void RIDVPProcessor::processFrame(const std::vector<PointXYZI>& current_scan,
+                                  const Eigen::Isometry3d& pose) {
+    
+    // Initialize current labeled points
+    current_labeled_.clear();
+    current_labeled_.reserve(current_scan.size());
+    for (const auto& pt : current_scan) {
+        PointWithLabel labeled;
+        labeled.x = pt.x;
+        labeled.y = pt.y;
+        labeled.z = pt.z;
+        labeled.intensity = pt.intensity;
+        labeled.label = 0;  // Unknown
+        labeled.cluster_id = -1;
+        current_labeled_.push_back(labeled);
+    }
+    
+    // ====== Stage A: Physics-Based Preprocessing ======
+    std::vector<float> calib_intensities = calibrateIntensities(current_scan);
+    
+    // Store calibrated intensities
+    for (size_t i = 0; i < current_labeled_.size(); ++i) {
+        current_labeled_[i].calibrated_intensity = calib_intensities[i];
+    }
+    
+    // ====== Stage B: Build Range Images ======
+    buildCurrentRangeImage(current_scan, calib_intensities);
+    buildMapRangeImage(pose);
+    
+    // If this is the first frame, just add all points to map
+    if (frame_count_ == 0) {
+        // Transform to world frame and add to map
+        for (auto& pt : current_labeled_) {
+            Eigen::Vector3d local(pt.x, pt.y, pt.z);
+            Eigen::Vector3d world = pose * local;
+            pt.x = static_cast<float>(world.x());
+            pt.y = static_cast<float>(world.y());
+            pt.z = static_cast<float>(world.z());
+            pt.label = 1;  // Initially static
+            global_map_->insertPoint(pt);
+        }
+        frame_count_++;
+        return;
+    }
+    
+    // ====== Stage C: Dual-Criterion Decision (Aggressive Remove) ======
+    std::vector<int> candidate_indices = dualCriterionDecision();
+    
+    // Mark non-candidates as static
+    for (auto& pt : current_labeled_) {
+        if (pt.label == 0) {
+            pt.label = 1;  // Static
+        }
+    }
+    
+    // ====== Stage D: Topology Adhesion Correction (Conservative Revert) ======
+    std::vector<int> dynamic_indices = topologyAdhesionCorrection(candidate_indices);
+    
+    // ====== Stage E: Temporal Integration ======
+    temporalIntegration(dynamic_indices);
+    
+    // ====== Update Global Map with Static Points ======
+    for (auto& pt : current_labeled_) {
+        if (pt.label == 1) {  // Static points
+            // Transform to world frame
+            Eigen::Vector3d local(pt.x, pt.y, pt.z);
+            Eigen::Vector3d world = pose * local;
+            pt.x = static_cast<float>(world.x());
+            pt.y = static_cast<float>(world.y());
+            pt.z = static_cast<float>(world.z());
+            global_map_->insertPoint(pt);
+        }
+    }
+    
+    frame_count_++;
+}
+
+// ============================================================================
+// Result Retrieval
+// ============================================================================
+std::vector<PointWithLabel> RIDVPProcessor::getStaticMap() const {
+    return global_map_->getStaticPoints();
+}
+
+std::vector<PointWithLabel> RIDVPProcessor::getDynamicPoints() const {
+    std::vector<PointWithLabel> result;
+    for (const auto& pt : current_labeled_) {
+        if (pt.label == 2 || pt.label == 3) {
+            result.push_back(pt);
+        }
+    }
+    return result;
+}
+
+std::vector<PointWithLabel> RIDVPProcessor::getCurrentFrameLabeled() const {
+    return current_labeled_;
+}
+
+} // namespace ri_dvp

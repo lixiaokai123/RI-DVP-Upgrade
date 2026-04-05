@@ -1,0 +1,265 @@
+#pragma once
+
+#include <vector>
+#include <array>
+#include <cmath>
+#include <memory>
+#include <unordered_map>
+#include <queue>
+#include <Eigen/Dense>
+#include <Eigen/Geometry>
+
+namespace ri_dvp {
+
+// ============================================================================
+// Configuration Parameters
+// ============================================================================
+struct RIDVPConfig {
+    // Range Image parameters
+    int img_width = 1024;           // Horizontal resolution
+    int img_height = 64;            // Vertical resolution (16-beam: 16, 64-beam: 64)
+    double fov_up = 15.0;           // Upper vertical FOV (degrees)
+    double fov_down = -25.0;        // Lower vertical FOV (degrees)
+    
+    // Intensity calibration parameters
+    double ref_range = 20.0;        // Reference range R_ref (meters)
+    double range_exponent = 2.0;    // Exponent η for range correction
+    double grazing_angle_thresh = 75.0;  // Grazing angle threshold (degrees)
+    
+    // Dual-criterion thresholds
+    double tau_dist_high = 0.5;     // High distance threshold (meters)
+    double tau_dist_low = 0.1;      // Low distance threshold (meters)
+    double tau_intensity = 0.15;    // Intensity difference threshold
+    
+    // Clustering parameters
+    double cluster_tolerance = 0.3; // Euclidean clustering tolerance (meters)
+    int min_cluster_size = 5;
+    int max_cluster_size = 50000;
+    
+    // Adhesion correction parameters
+    double adhesion_dist_thresh = 0.05;  // δ_adh (meters)
+    double linear_ratio_thresh = 0.8;    // Threshold for linear shape detection
+    int min_static_neighbors = 10;
+    
+    // Temporal integration parameters
+    int sliding_window_size = 5;         // N consecutive frames
+    double dynamic_probability_thresh = 0.7;
+    
+    // Voxel parameters for map
+    double voxel_size = 0.1;        // Voxel resolution (meters)
+};
+
+// ============================================================================
+// Point Types
+// ============================================================================
+struct PointXYZI {
+    float x, y, z;
+    float intensity;
+    
+    PointXYZI() : x(0), y(0), z(0), intensity(0) {}
+    PointXYZI(float x_, float y_, float z_, float i_) 
+        : x(x_), y(y_), z(z_), intensity(i_) {}
+    
+    Eigen::Vector3f position() const { return Eigen::Vector3f(x, y, z); }
+    float range() const { return std::sqrt(x*x + y*y + z*z); }
+};
+
+struct PointWithLabel : public PointXYZI {
+    float calibrated_intensity;
+    int label;  // 0: unknown, 1: static, 2: dynamic_candidate, 3: dynamic_confirmed
+    int cluster_id;
+    
+    PointWithLabel() : PointXYZI(), calibrated_intensity(0), label(0), cluster_id(-1) {}
+};
+
+// ============================================================================
+// Range Image Structure
+// ============================================================================
+struct RangeImagePixel {
+    float range;
+    float intensity;
+    float calibrated_intensity;
+    int point_index;
+    bool valid;
+    
+    RangeImagePixel() : range(0), intensity(0), calibrated_intensity(0), 
+                        point_index(-1), valid(false) {}
+};
+
+class RangeImage {
+public:
+    RangeImage(int width, int height, double fov_up, double fov_down);
+    
+    void clear();
+    void projectPoint(const PointXYZI& point, int index, float calib_intensity);
+    void projectPointCloud(const std::vector<PointXYZI>& cloud, 
+                          const std::vector<float>& calib_intensities);
+    
+    std::pair<int, int> getPixelCoord(float x, float y, float z) const;
+    const RangeImagePixel& at(int u, int v) const;
+    RangeImagePixel& at(int u, int v);
+    
+    int width() const { return width_; }
+    int height() const { return height_; }
+
+private:
+    int width_, height_;
+    double fov_up_, fov_down_, fov_range_;
+    std::vector<RangeImagePixel> data_;
+};
+
+// ============================================================================
+// Voxel Map for Global Map Storage
+// ============================================================================
+struct VoxelKey {
+    int x, y, z;
+    
+    bool operator==(const VoxelKey& other) const {
+        return x == other.x && y == other.y && z == other.z;
+    }
+};
+
+struct VoxelKeyHash {
+    size_t operator()(const VoxelKey& key) const {
+        return std::hash<int>()(key.x) ^ 
+               (std::hash<int>()(key.y) << 1) ^ 
+               (std::hash<int>()(key.z) << 2);
+    }
+};
+
+struct VoxelData {
+    std::vector<PointWithLabel> points;
+    float avg_intensity;
+    float avg_calibrated_intensity;
+    int observation_count;
+    float dynamic_probability;
+    
+    VoxelData() : avg_intensity(0), avg_calibrated_intensity(0), 
+                  observation_count(0), dynamic_probability(0.5f) {}
+};
+
+class VoxelMap {
+public:
+    explicit VoxelMap(double voxel_size);
+    
+    VoxelKey getKey(float x, float y, float z) const;
+    void insertPoint(const PointWithLabel& point);
+    VoxelData* getVoxel(const VoxelKey& key);
+    const VoxelData* getVoxel(const VoxelKey& key) const;
+    
+    std::vector<PointWithLabel> getAllPoints() const;
+    std::vector<PointWithLabel> getStaticPoints() const;
+    void updateProbabilities(const std::vector<VoxelKey>& dynamic_voxels);
+    void pruneHighProbabilityDynamic(double thresh);
+    
+    size_t size() const { return data_.size(); }
+
+private:
+    double voxel_size_;
+    double inv_voxel_size_;
+    std::unordered_map<VoxelKey, VoxelData, VoxelKeyHash> data_;
+};
+
+// ============================================================================
+// Euclidean Clustering
+// ============================================================================
+class EuclideanClusterer {
+public:
+    EuclideanClusterer(double tolerance, int min_size, int max_size);
+    
+    std::vector<std::vector<int>> cluster(const std::vector<PointWithLabel>& points,
+                                          const std::vector<int>& indices);
+
+private:
+    double tolerance_;
+    double tolerance_sq_;
+    int min_size_;
+    int max_size_;
+    
+    void regionGrowing(const std::vector<PointWithLabel>& points,
+                       const std::vector<int>& indices,
+                       int seed_idx,
+                       std::vector<bool>& visited,
+                       std::vector<int>& cluster);
+};
+
+// ============================================================================
+// Normal Estimation
+// ============================================================================
+class NormalEstimator {
+public:
+    explicit NormalEstimator(int k_neighbors = 10);
+    
+    Eigen::Vector3f estimateNormal(const std::vector<PointXYZI>& cloud, int index) const;
+    std::vector<Eigen::Vector3f> estimateNormals(const std::vector<PointXYZI>& cloud) const;
+
+private:
+    int k_neighbors_;
+    
+    std::vector<int> findKNearest(const std::vector<PointXYZI>& cloud, 
+                                  int index, int k) const;
+};
+
+// ============================================================================
+// Main RI-DVP Processor
+// ============================================================================
+class RIDVPProcessor {
+public:
+    explicit RIDVPProcessor(const RIDVPConfig& config = RIDVPConfig());
+    
+    // Main processing pipeline
+    void processFrame(const std::vector<PointXYZI>& current_scan,
+                      const Eigen::Isometry3d& pose);
+    
+    // Get results
+    std::vector<PointWithLabel> getStaticMap() const;
+    std::vector<PointWithLabel> getDynamicPoints() const;
+    std::vector<PointWithLabel> getCurrentFrameLabeled() const;
+    
+    // Module access (for debugging/visualization)
+    const RangeImage& getCurrentRangeImage() const { return *ri_current_; }
+    const RangeImage& getMapRangeImage() const { return *ri_map_; }
+
+private:
+    RIDVPConfig config_;
+    
+    // Range images
+    std::unique_ptr<RangeImage> ri_current_;
+    std::unique_ptr<RangeImage> ri_map_;
+    
+    // Global map
+    std::unique_ptr<VoxelMap> global_map_;
+    
+    // Processing components
+    std::unique_ptr<NormalEstimator> normal_estimator_;
+    std::unique_ptr<EuclideanClusterer> clusterer_;
+    
+    // Current frame data
+    std::vector<PointWithLabel> current_labeled_;
+    std::vector<Eigen::Vector3f> current_normals_;
+    
+    // Temporal buffer
+    std::deque<std::vector<VoxelKey>> dynamic_history_;
+    
+    // Frame counter
+    int frame_count_;
+    
+    // Pipeline stages
+    std::vector<float> calibrateIntensities(const std::vector<PointXYZI>& cloud);
+    void buildCurrentRangeImage(const std::vector<PointXYZI>& cloud,
+                                const std::vector<float>& calib_intensities);
+    void buildMapRangeImage(const Eigen::Isometry3d& pose);
+    std::vector<int> dualCriterionDecision();
+    std::vector<int> topologyAdhesionCorrection(const std::vector<int>& candidates);
+    void temporalIntegration(const std::vector<int>& dynamic_indices);
+    
+    // Helper functions
+    float computeIncidenceAngle(const PointXYZI& point, 
+                                const Eigen::Vector3f& normal) const;
+    float sigmoidClamp(float cos_alpha) const;
+    bool isLinearShape(const std::vector<PointWithLabel>& cluster_points) const;
+    float computeAdhesionScore(const std::vector<PointWithLabel>& cluster_points,
+                               const std::vector<PointWithLabel>& static_points) const;
+};
+
+} // namespace ri_dvp

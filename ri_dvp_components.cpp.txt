@@ -1,0 +1,327 @@
+#include "ri_dvp.hpp"
+#include <limits>
+#include <algorithm>
+
+namespace ri_dvp {
+
+// ============================================================================
+// RangeImage Implementation
+// ============================================================================
+RangeImage::RangeImage(int width, int height, double fov_up, double fov_down)
+    : width_(width), height_(height), 
+      fov_up_(fov_up * M_PI / 180.0), 
+      fov_down_(fov_down * M_PI / 180.0) {
+    fov_range_ = fov_up_ - fov_down_;
+    data_.resize(width_ * height_);
+}
+
+void RangeImage::clear() {
+    for (auto& pixel : data_) {
+        pixel = RangeImagePixel();
+    }
+}
+
+std::pair<int, int> RangeImage::getPixelCoord(float x, float y, float z) const {
+    float range = std::sqrt(x*x + y*y + z*z);
+    if (range < 1e-6) return {-1, -1};
+    
+    // Spherical projection
+    float yaw = std::atan2(y, x);           // [-π, π]
+    float pitch = std::asin(z / range);     // [-π/2, π/2]
+    
+    // Normalize to image coordinates
+    int u = static_cast<int>((0.5 * (1.0 - yaw / M_PI)) * width_);
+    int v = static_cast<int>((1.0 - (pitch - fov_down_) / fov_range_) * height_);
+    
+    // Boundary check
+    u = std::clamp(u, 0, width_ - 1);
+    v = std::clamp(v, 0, height_ - 1);
+    
+    return {u, v};
+}
+
+void RangeImage::projectPoint(const PointXYZI& point, int index, float calib_intensity) {
+    auto [u, v] = getPixelCoord(point.x, point.y, point.z);
+    if (u < 0 || v < 0) return;
+    
+    float range = point.range();
+    RangeImagePixel& pixel = at(u, v);
+    
+    // Z-buffer: keep closest point
+    if (!pixel.valid || range < pixel.range) {
+        pixel.range = range;
+        pixel.intensity = point.intensity;
+        pixel.calibrated_intensity = calib_intensity;
+        pixel.point_index = index;
+        pixel.valid = true;
+    }
+}
+
+void RangeImage::projectPointCloud(const std::vector<PointXYZI>& cloud,
+                                   const std::vector<float>& calib_intensities) {
+    clear();
+    for (size_t i = 0; i < cloud.size(); ++i) {
+        projectPoint(cloud[i], static_cast<int>(i), calib_intensities[i]);
+    }
+}
+
+const RangeImagePixel& RangeImage::at(int u, int v) const {
+    return data_[v * width_ + u];
+}
+
+RangeImagePixel& RangeImage::at(int u, int v) {
+    return data_[v * width_ + u];
+}
+
+// ============================================================================
+// VoxelMap Implementation
+// ============================================================================
+VoxelMap::VoxelMap(double voxel_size) 
+    : voxel_size_(voxel_size), inv_voxel_size_(1.0 / voxel_size) {}
+
+VoxelKey VoxelMap::getKey(float x, float y, float z) const {
+    return VoxelKey{
+        static_cast<int>(std::floor(x * inv_voxel_size_)),
+        static_cast<int>(std::floor(y * inv_voxel_size_)),
+        static_cast<int>(std::floor(z * inv_voxel_size_))
+    };
+}
+
+void VoxelMap::insertPoint(const PointWithLabel& point) {
+    VoxelKey key = getKey(point.x, point.y, point.z);
+    VoxelData& voxel = data_[key];
+    
+    // Update running average
+    int n = voxel.points.size();
+    voxel.avg_intensity = (voxel.avg_intensity * n + point.intensity) / (n + 1);
+    voxel.avg_calibrated_intensity = 
+        (voxel.avg_calibrated_intensity * n + point.calibrated_intensity) / (n + 1);
+    
+    voxel.points.push_back(point);
+    voxel.observation_count++;
+}
+
+VoxelData* VoxelMap::getVoxel(const VoxelKey& key) {
+    auto it = data_.find(key);
+    return (it != data_.end()) ? &it->second : nullptr;
+}
+
+const VoxelData* VoxelMap::getVoxel(const VoxelKey& key) const {
+    auto it = data_.find(key);
+    return (it != data_.end()) ? &it->second : nullptr;
+}
+
+std::vector<PointWithLabel> VoxelMap::getAllPoints() const {
+    std::vector<PointWithLabel> result;
+    for (const auto& [key, voxel] : data_) {
+        result.insert(result.end(), voxel.points.begin(), voxel.points.end());
+    }
+    return result;
+}
+
+std::vector<PointWithLabel> VoxelMap::getStaticPoints() const {
+    std::vector<PointWithLabel> result;
+    for (const auto& [key, voxel] : data_) {
+        // Include points from voxels with low dynamic probability
+        // or points that are labeled as static
+        for (const auto& pt : voxel.points) {
+            if (pt.label == 1 || (pt.label == 0 && voxel.dynamic_probability < 0.5)) {
+                result.push_back(pt);
+            }
+        }
+    }
+    return result;
+}
+
+void VoxelMap::updateProbabilities(const std::vector<VoxelKey>& dynamic_voxels) {
+    // Decay all probabilities slightly toward 0.5
+    for (auto& [key, voxel] : data_) {
+        voxel.dynamic_probability = 0.9f * voxel.dynamic_probability + 0.1f * 0.5f;
+    }
+    
+    // Increase probability for observed dynamic voxels
+    for (const auto& key : dynamic_voxels) {
+        auto it = data_.find(key);
+        if (it != data_.end()) {
+            // Bayesian update: P(dynamic | observation)
+            float prior = it->second.dynamic_probability;
+            float likelihood = 0.9f;  // P(observe_dynamic | is_dynamic)
+            float evidence = prior * likelihood + (1 - prior) * 0.1f;
+            it->second.dynamic_probability = (prior * likelihood) / evidence;
+        }
+    }
+}
+
+void VoxelMap::pruneHighProbabilityDynamic(double thresh) {
+    for (auto it = data_.begin(); it != data_.end(); ) {
+        if (it->second.dynamic_probability > thresh) {
+            it = data_.erase(it);
+        } else {
+            ++it;
+        }
+    }
+}
+
+// ============================================================================
+// EuclideanClusterer Implementation
+// ============================================================================
+EuclideanClusterer::EuclideanClusterer(double tolerance, int min_size, int max_size)
+    : tolerance_(tolerance), tolerance_sq_(tolerance * tolerance),
+      min_size_(min_size), max_size_(max_size) {}
+
+std::vector<std::vector<int>> EuclideanClusterer::cluster(
+    const std::vector<PointWithLabel>& points,
+    const std::vector<int>& indices) {
+    
+    std::vector<std::vector<int>> clusters;
+    if (indices.empty()) return clusters;
+    
+    std::vector<bool> visited(indices.size(), false);
+    
+    for (size_t i = 0; i < indices.size(); ++i) {
+        if (visited[i]) continue;
+        
+        std::vector<int> cluster;
+        regionGrowing(points, indices, i, visited, cluster);
+        
+        if (cluster.size() >= static_cast<size_t>(min_size_) && 
+            cluster.size() <= static_cast<size_t>(max_size_)) {
+            clusters.push_back(std::move(cluster));
+        }
+    }
+    
+    return clusters;
+}
+
+void EuclideanClusterer::regionGrowing(
+    const std::vector<PointWithLabel>& points,
+    const std::vector<int>& indices,
+    int seed_idx,
+    std::vector<bool>& visited,
+    std::vector<int>& cluster) {
+    
+    std::queue<int> queue;
+    queue.push(seed_idx);
+    visited[seed_idx] = true;
+    
+    while (!queue.empty()) {
+        int current_idx = queue.front();
+        queue.pop();
+        
+        int pt_idx = indices[current_idx];
+        cluster.push_back(pt_idx);
+        
+        const PointWithLabel& current = points[pt_idx];
+        
+        // Find neighbors within tolerance
+        for (size_t i = 0; i < indices.size(); ++i) {
+            if (visited[i]) continue;
+            
+            const PointWithLabel& neighbor = points[indices[i]];
+            float dx = current.x - neighbor.x;
+            float dy = current.y - neighbor.y;
+            float dz = current.z - neighbor.z;
+            float dist_sq = dx*dx + dy*dy + dz*dz;
+            
+            if (dist_sq < tolerance_sq_) {
+                visited[i] = true;
+                queue.push(i);
+            }
+        }
+        
+        if (cluster.size() > static_cast<size_t>(max_size_)) break;
+    }
+}
+
+// ============================================================================
+// NormalEstimator Implementation
+// ============================================================================
+NormalEstimator::NormalEstimator(int k_neighbors) : k_neighbors_(k_neighbors) {}
+
+std::vector<int> NormalEstimator::findKNearest(
+    const std::vector<PointXYZI>& cloud, int index, int k) const {
+    
+    std::vector<std::pair<float, int>> distances;
+    distances.reserve(cloud.size());
+    
+    const PointXYZI& query = cloud[index];
+    
+    for (size_t i = 0; i < cloud.size(); ++i) {
+        if (static_cast<int>(i) == index) continue;
+        
+        float dx = cloud[i].x - query.x;
+        float dy = cloud[i].y - query.y;
+        float dz = cloud[i].z - query.z;
+        float dist_sq = dx*dx + dy*dy + dz*dz;
+        
+        distances.emplace_back(dist_sq, i);
+    }
+    
+    // Partial sort to get k nearest
+    int k_actual = std::min(k, static_cast<int>(distances.size()));
+    std::partial_sort(distances.begin(), distances.begin() + k_actual, distances.end());
+    
+    std::vector<int> indices;
+    indices.reserve(k_actual);
+    for (int i = 0; i < k_actual; ++i) {
+        indices.push_back(distances[i].second);
+    }
+    
+    return indices;
+}
+
+Eigen::Vector3f NormalEstimator::estimateNormal(
+    const std::vector<PointXYZI>& cloud, int index) const {
+    
+    auto neighbors = findKNearest(cloud, index, k_neighbors_);
+    if (neighbors.size() < 3) {
+        return Eigen::Vector3f(0, 0, 1);  // Default upward normal
+    }
+    
+    // Compute centroid
+    Eigen::Vector3f centroid = Eigen::Vector3f::Zero();
+    centroid += cloud[index].position();
+    for (int idx : neighbors) {
+        centroid += cloud[idx].position();
+    }
+    centroid /= (neighbors.size() + 1);
+    
+    // Compute covariance matrix
+    Eigen::Matrix3f cov = Eigen::Matrix3f::Zero();
+    
+    auto addToCov = [&](const PointXYZI& pt) {
+        Eigen::Vector3f d = pt.position() - centroid;
+        cov += d * d.transpose();
+    };
+    
+    addToCov(cloud[index]);
+    for (int idx : neighbors) {
+        addToCov(cloud[idx]);
+    }
+    
+    // Eigenvalue decomposition - smallest eigenvector is normal
+    Eigen::SelfAdjointEigenSolver<Eigen::Matrix3f> solver(cov);
+    Eigen::Vector3f normal = solver.eigenvectors().col(0);
+    
+    // Orient normal consistently (toward sensor origin)
+    if (normal.dot(-cloud[index].position()) < 0) {
+        normal = -normal;
+    }
+    
+    return normal;
+}
+
+std::vector<Eigen::Vector3f> NormalEstimator::estimateNormals(
+    const std::vector<PointXYZI>& cloud) const {
+    
+    std::vector<Eigen::Vector3f> normals;
+    normals.reserve(cloud.size());
+    
+    for (size_t i = 0; i < cloud.size(); ++i) {
+        normals.push_back(estimateNormal(cloud, i));
+    }
+    
+    return normals;
+}
+
+} // namespace ri_dvp

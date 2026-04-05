@@ -1,0 +1,36 @@
+<!-- 
+  realtime_to_pcd.launch
+  实时订阅点云话题并保存为PCD
+  
+  使用方法:
+    1. 启动此launch:
+       roslaunch rosbag2pcd realtime_to_pcd.launch \
+           pose_file:=/path/to/poses.txt \
+           output_dir:=/path/to/output
+    
+    2. 播放rosbag:
+       rosbag play data.bag
+-->
+<launch>
+    <!-- 必需参数 -->
+    <arg name="pose_file" doc="Path to the pose txt file"/>
+    <arg name="output_dir" default="$(find rosbag2pcd)/output" doc="Output directory"/>
+    
+    <!-- 可选参数 -->
+    <arg name="topic" default="/rslidar_points" doc="PointCloud2 topic name"/>
+    <arg name="map_file" default="map.pcd" doc="Output map filename"/>
+    <arg name="pose_format" default="1" doc="Pose file format"/>
+    <arg name="voxel_size" default="0.1" doc="Voxel size for map"/>
+    <arg name="build_map" default="true" doc="Whether to build merged map"/>
+    
+    <!-- 启动实时转换节点 -->
+    <node pkg="rosbag2pcd" type="pointcloud_to_pcd_node" name="pointcloud_to_pcd" output="screen">
+        <param name="pose_file" value="$(arg pose_file)"/>
+        <param name="output_dir" value="$(arg output_dir)"/>
+        <param name="topic" value="$(arg topic)"/>
+        <param name="map_file" value="$(arg map_file)"/>
+        <param name="pose_format" value="$(arg pose_format)"/>
+        <param name="voxel_size" value="$(arg voxel_size)"/>
+        <param name="build_map" value="$(arg build_map)"/>
+    </node>
+</launch>
